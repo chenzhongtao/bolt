@@ -14,20 +14,20 @@ import (
 type txid uint64
 
 // Tx represents a read-only or read/write transaction on the database.
-// Read-only transactions can be used for retrieving values for keys and creating cursors.
+// Read-only transactions can be used for retrieving检索 values for keys and creating cursors.
 // Read/write transactions can create and remove buckets and create and remove keys.
 //
 // IMPORTANT: You must commit or rollback transactions when you are done with
-// them. Pages can not be reclaimed by the writer until no more transactions
+// them. Pages can not be reclaimed回收 by the writer until no more transactions
 // are using them. A long running read transaction can cause the database to
 // quickly grow.
 type Tx struct {
 	writable       bool
 	managed        bool
 	db             *DB
-	meta           *meta
-	root           Bucket
-	pages          map[pgid]*page
+	meta           *meta          // tx.db.meta()的一个拷贝
+	root           Bucket         //每个tx都要重新new一个bucket   tx.root.bucket = tx.meta.root = db.meta.root
+	pages          map[pgid]*page //被修改，暂未落盘的page
 	stats          TxStats
 	commitHandlers []func()
 
@@ -141,6 +141,9 @@ func (tx *Tx) OnCommit(fn func()) {
 // Commit writes all changes to disk and updates the meta page.
 // Returns an error if a disk write error occurs, or if Commit is
 // called on a read-only transaction.
+// 每次commit至少要写3次磁盘，要写修改的node,freelist,meta, 如果树高度比较高，有很多node要写，写次数会增加 (如果CreateBucket bucket本来就存在，这没有node修改，只需提交两次freelist,meta)
+// boltdb的事务实现：每次修改都分配新的page,page写在其他位置，不覆盖之前的位置，然后写新的freelist，也是保留旧的freelist，再写新的meta
+// meta 有两份，保存在page0和page1,每次事务轮流写meta0和meta1，写meta失败还能从另外的meta恢复旧的数据。
 func (tx *Tx) Commit() error {
 	_assert(!tx.managed, "managed tx commit not allowed")
 	if tx.db == nil {
@@ -153,13 +156,14 @@ func (tx *Tx) Commit() error {
 
 	// Rebalance nodes which have had deletions.
 	var startTime = time.Now()
-	tx.root.rebalance()
+	tx.root.rebalance() //合并节点，有删除时才需要rebalance
 	if tx.stats.Rebalance > 0 {
 		tx.stats.RebalanceTime += time.Since(startTime)
 	}
 
-	// spill data onto dirty pages.
+	// spill溢出 data onto dirty pages.
 	startTime = time.Now()
+	//需要落盘的page只是先放在缓存tx.pages中，由tx.write()统一落盘,spill判断所有node需不需要切成多个node,node代表的是有修改过的page
 	if err := tx.root.spill(); err != nil {
 		tx.rollback()
 		return err
@@ -167,12 +171,16 @@ func (tx *Tx) Commit() error {
 	tx.stats.SpillTime += time.Since(startTime)
 
 	// Free the old root bucket.
+	// root bucket新的page写到tx.meta，等一下调用tx.writeMeta()落盘，新的路径生效，如果没有page修改过，CreateBucket bucket本来就存在，
+	// 这时tx.root.root == tx.meta.root.root （可以跳过freelist和meta落盘？ meta.txid有变化，还是要重新落盘）
+	// fmt.Printf("old root %d new root %d\n", tx.meta.root.root, tx.root.root)
 	tx.meta.root.root = tx.root.root
 
 	opgid := tx.meta.pgid
 
-	// Free the freelist and allocate new pages for it. This will overestimate
-	// the size of the freelist but not underestimate the size (which would be bad).
+	// Free the freelist and allocate new pages for it. This will overestimate(过高估计)
+	// the size of the freelist but not underestimate（过低估计） the size (which would be bad).
+	// 把最新的freelist落盘，只是先放在缓存tx.pages中，由tx.write()统一落盘
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
@@ -252,6 +260,7 @@ func (tx *Tx) rollback() {
 	}
 	if tx.writable {
 		tx.db.freelist.rollback(tx.meta.txid)
+		// 重新加载freelist，此时的db.meta().freelist还是老的freelist，tx.meta 只是db.meta()的一份拷贝
 		tx.db.freelist.reload(tx.db.page(tx.db.meta().freelist))
 	}
 	tx.close()
@@ -469,6 +478,7 @@ func (tx *Tx) allocate(count int) (*page, error) {
 }
 
 // write writes any dirty pages to disk.
+// 把缓存的tx.pages的脏页写入磁盘
 func (tx *Tx) write() error {
 	// Sort pages by id.
 	pages := make(pages, 0, len(tx.pages))
@@ -544,6 +554,7 @@ func (tx *Tx) write() error {
 // writeMeta writes the meta to the disk.
 func (tx *Tx) writeMeta() error {
 	// Create a temporary buffer for the meta page.
+	// 构造一个meta page
 	buf := make([]byte, tx.db.pageSize)
 	p := tx.db.pageInBuffer(buf, 0)
 	tx.meta.write(p)

@@ -96,17 +96,17 @@ type DB struct {
 
 	path     string
 	file     *os.File
-	lockfile *os.File // windows only
-	dataref  []byte   // mmap'ed readonly, write throws SEGV
-	data     *[maxMapSize]byte
-	datasz   int
-	filesz   int // current on disk file size
+	lockfile *os.File          // windows only
+	dataref  []byte            // mmap'ed readonly, write throws SEGV
+	data     *[maxMapSize]byte // 只读map 写入需要调用db.ops.writeAt 见（tx.write）
+	datasz   int               // 当前map的大小
+	filesz   int               // current on disk file size
 	meta0    *meta
 	meta1    *meta
 	pageSize int
 	opened   bool
-	rwtx     *Tx
-	txs      []*Tx
+	rwtx     *Tx   //只有一个读写事务
+	txs      []*Tx //只读事务可以有很多个
 	freelist *freelist
 	stats    Stats
 
@@ -305,6 +305,7 @@ func (db *DB) munmap() error {
 // mmapSize determines the appropriate size for the mmap given the current size
 // of the database. The minimum size is 32KB and doubles until it reaches 1GB.
 // Returns an error if the new mmap size is greater than the max allowed.
+// 最小32K，小于1G时，每次增加1倍，大于1G时，每次增加1G
 func (db *DB) mmapSize(size int) (int, error) {
 	// Double the size from 32KB until 1GB.
 	for i := uint(15); i <= 30; i++ {
@@ -339,6 +340,13 @@ func (db *DB) mmapSize(size int) (int, error) {
 	return int(sz), nil
 }
 
+/*
+boltdb采用单个文件来将数据存储在磁盘上，该文件的前4个page是固定的:
+第1个page为meta
+第2个page为meta
+第3个page是freelist，存储了一个int数组，
+第4个page是leaf page
+*/
 // init creates a new database file and initializes its meta pages.
 func (db *DB) init() error {
 	// Set the page size to the OS page size.
@@ -362,6 +370,7 @@ func (db *DB) init() error {
 		m.txid = txid(i)
 		m.checksum = m.sum64()
 	}
+	// meta0 meta1 永远在page0，page1, freelist和root bucket
 
 	// Write an empty freelist at page 3.
 	p := db.pageInBuffer(buf[:], pgid(2))
@@ -824,6 +833,7 @@ func (db *DB) meta() *meta {
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
+// 分配count个page
 func (db *DB) allocate(count int) (*page, error) {
 	// Allocate a temporary buffer for the page.
 	var buf []byte
@@ -836,6 +846,7 @@ func (db *DB) allocate(count int) (*page, error) {
 	p.overflow = uint32(count - 1)
 
 	// Use pages from the freelist if they are available.
+	// 先从freelist分配，0 表示没有符合要求的
 	if p.id = db.freelist.allocate(count); p.id != 0 {
 		return p, nil
 	}
@@ -929,10 +940,10 @@ var DefaultOptions = &Options{
 // Stats represents statistics about the database.
 type Stats struct {
 	// Freelist stats
-	FreePageN     int // total number of free pages on the freelist
-	PendingPageN  int // total number of pending pages on the freelist
-	FreeAlloc     int // total bytes allocated in free pages
-	FreelistInuse int // total bytes used by the freelist
+	FreePageN     int // total number of free pages on the freelist   // freelist.free_count()
+	PendingPageN  int // total number of pending pages on the freelist // freelist.pending_count()
+	FreeAlloc     int // total bytes allocated in free pages   // (FreePageN+PendingPageN)*pageSize
+	FreelistInuse int // total bytes used by the freelist  // freelist.size()
 
 	// Transaction stats
 	TxN     int // total number of started read transactions
@@ -968,15 +979,15 @@ type Info struct {
 }
 
 type meta struct {
-	magic    uint32
-	version  uint32
-	pageSize uint32
-	flags    uint32
-	root     bucket
-	freelist pgid
-	pgid     pgid
-	txid     txid
-	checksum uint64
+	magic    uint32 // 存储魔数0xED0CDAED
+	version  uint32 // 标明存储格式的版本，现在是2
+	pageSize uint32 // 标明每个page的大小
+	flags    uint32 // 当前已无用
+	root     bucket // 根Bucket
+	freelist pgid   // 标明当前freelist数据存在哪个page中
+	pgid     pgid   // 当前最大pgid
+	txid     txid   // 当前事务id值，读事务不增加
+	checksum uint64 // 以上数据的校验和，校验数据是否损坏
 }
 
 // validate checks the marker bytes and version of the meta page to ensure it matches this binary.
@@ -1005,12 +1016,14 @@ func (m *meta) write(p *page) {
 	}
 
 	// Page id is either going to be 0 or 1 which we can determine by the transaction ID.
+	// 连续两个事务写不同的page,轮流写page1，page2,对应meta0,meta1
 	p.id = pgid(m.txid % 2)
 	p.flags |= metaPageFlag
 
 	// Calculate the checksum.
 	m.checksum = m.sum64()
 
+	// m的值往p拷贝
 	m.copy(p.meta())
 }
 

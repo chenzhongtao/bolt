@@ -7,13 +7,13 @@ import (
 	"unsafe"
 )
 
-// node represents an in-memory, deserialized page.
+// node represents an in-memory, deserialized反序列化 page. node代表的是有修改过的page
 type node struct {
 	bucket     *Bucket
-	isLeaf     bool
-	unbalanced bool
-	spilled    bool
-	key        []byte
+	isLeaf     bool   // 标记该节点是否为叶子节点，决定inode中记录的是什么
+	unbalanced bool   // 当该node上有删除操作时，标记为true，当Tx执行Commit时，会执行rebalance，将inode重新排列
+	spilled    bool   // 是否溢出
+	key        []byte // 当加载page变成node缓存时，将该node下边界inode[0]的key缓存在node上，用于在parent node 查找本身时使用
 	pgid       pgid
 	parent     *node
 	children   nodes
@@ -128,6 +128,7 @@ func (n *node) put(oldKey, newKey, value []byte, pgid pgid, flags uint32) {
 	// Add capacity and shift nodes if we don't have an exact match and need to insert.
 	exact := (len(n.inodes) > 0 && index < len(n.inodes) && bytes.Equal(n.inodes[index].key, oldKey))
 	if !exact {
+		//键不存在,新增一个inode
 		n.inodes = append(n.inodes, inode{})
 		copy(n.inodes[index+1:], n.inodes[index:])
 	}
@@ -166,12 +167,12 @@ func (n *node) read(p *page) {
 	for i := 0; i < int(p.count); i++ {
 		inode := &n.inodes[i]
 		if n.isLeaf {
-			elem := p.leafPageElement(uint16(i))
+			elem := p.leafPageElement(uint16(i)) //# 叶子
 			inode.flags = elem.flags
 			inode.key = elem.key()
 			inode.value = elem.value()
 		} else {
-			elem := p.branchPageElement(uint16(i))
+			elem := p.branchPageElement(uint16(i)) //# 树枝
 			inode.pgid = elem.pgid
 			inode.key = elem.key()
 		}
@@ -207,6 +208,7 @@ func (n *node) write(p *page) {
 	}
 
 	// Loop over each item and write it to the page.
+	// leafPageElement 或 branchPageElement 个数为len(n.inodes)的元数据先放在前面，后面再放key和value
 	b := (*[maxAllocSize]byte)(unsafe.Pointer(&p.ptr))[n.pageElementSize()*len(n.inodes):]
 	for i, item := range n.inodes {
 		_assert(len(item.key) > 0, "write: zero-length inode key")
@@ -247,6 +249,7 @@ func (n *node) write(p *page) {
 
 // split breaks up a node into multiple smaller nodes, if appropriate.
 // This should only be called from the spill() function.
+// 把一个node分裂成多个node
 func (n *node) split(pageSize int) []*node {
 	var nodes []*node
 
@@ -290,7 +293,7 @@ func (n *node) splitTwo(pageSize int) (*node, *node) {
 	splitIndex, _ := n.splitIndex(threshold)
 
 	// Split node into two separate nodes.
-	// If there's no parent then we'll need to create one.
+	// If there's no parent then we'll need to create one. //如果是rootNode,parent就是nil,分配一个新的，pgid=0
 	if n.parent == nil {
 		n.parent = &node{bucket: n.bucket, children: []*node{n}}
 	}
@@ -359,12 +362,14 @@ func (n *node) spill() error {
 	var nodes = n.split(tx.db.pageSize)
 	for _, node := range nodes {
 		// Add node's page to the freelist if it's not new.
+		//释放旧的page,pgid = 0 表示新生成的node,还没对应的page,不用释放
 		if node.pgid > 0 {
 			tx.db.freelist.free(tx.meta.txid, tx.page(node.pgid))
 			node.pgid = 0
 		}
 
 		// Allocate contiguous space for the node.
+		// 分配新的page，新的page会缓存在tx.pages，会被落盘
 		p, err := tx.allocate((node.size() / tx.db.pageSize) + 1)
 		if err != nil {
 			return err
@@ -396,6 +401,7 @@ func (n *node) spill() error {
 
 	// If the root node split and created a new root then we need to spill that
 	// as well. We'll clear out the children to make sure it doesn't try to respill.
+	//n.parent != nil && n.parent.pgid == 0 代表是新创建的rootNode 具体见splitTwo
 	if n.parent != nil && n.parent.pgid == 0 {
 		n.children = nil
 		return n.parent.spill()
@@ -404,7 +410,7 @@ func (n *node) spill() error {
 	return nil
 }
 
-// rebalance attempts to combine the node with sibling nodes if the node fill
+// rebalance attempts to combine联合 the node with sibling nodes兄弟节点 if the node fill
 // size is below a threshold or if there are not enough keys.
 func (n *node) rebalance() {
 	if !n.unbalanced {
@@ -420,13 +426,17 @@ func (n *node) rebalance() {
 	if n.size() > threshold && len(n.inodes) > n.minKeys() {
 		return
 	}
+	//如果node的大小太小或者key的个数太少，需要rebalance
 
 	// Root node has special handling.
+	// 根节点需要特殊处理
 	if n.parent == nil {
 		// If root node is a branch and only has one node then collapse it.
+		// 根节点是树枝并且只有一个子节点
 		if !n.isLeaf && len(n.inodes) == 1 {
 			// Move root's child up.
 			child := n.bucket.node(n.inodes[0].pgid, n)
+			// 相当于把child提升为root
 			n.isLeaf = child.isLeaf
 			n.inodes = child.inodes[:]
 			n.children = child.children
@@ -460,6 +470,8 @@ func (n *node) rebalance() {
 	_assert(n.parent.numChildren() > 1, "parent must have at least 2 children")
 
 	// Destination node is right sibling if idx == 0, otherwise left sibling.
+	// 如果有左兄弟节点，数据往左兄弟节点合并，删除本节点，如果没有左兄弟节点，找到右兄弟节点，由右兄弟节点往本节点合并，删除右兄弟节点
+	// 只能由右往左合并，因为node.key记录的是下边界，右往左合并不用修改下边界
 	var target *node
 	var useNextSibling = (n.parent.childIndex(n) == 0)
 	if useNextSibling {
@@ -520,6 +532,7 @@ func (n *node) removeChild(target *node) {
 
 // dereference causes the node to copy all its inode key/value references to heap memory.
 // This is required when the mmap is reallocated so inodes are not pointing to stale data.
+// inode 的key,value本来是指向mmap的地址的，如要重新mmap，这些key/value引用的地址都会无效，需要在堆分配内存，拷贝出来
 func (n *node) dereference() {
 	if n.key != nil {
 		key := make([]byte, len(n.key))
@@ -595,10 +608,13 @@ func (s nodes) Less(i, j int) bool { return bytes.Compare(s[i].inodes[0].key, s[
 // It can be used to point to elements in a page or point
 // to an element which hasn't been added to a page yet.
 type inode struct {
-	flags uint32
-	pgid  pgid
-	key   []byte
-	value []byte
+	flags uint32 // 当所在node为叶子节点时，记录key的flag
+	pgid  pgid   // 当所在node为叶子节点时，不使用，当所在node为分支节点时，记录所指向的page-id
+	key   []byte // 当所在node为叶子节点时，记录的为拥有的key；当所在node为分支节点时，记录的是子
+	// 节点的上key的下边界。例如，当当前node为分支节点，拥有3个分支，[1,2,3][5,6,7][10,11,12]
+	// 这该node上可能有3个inode，记录的key为[1,5,10]。当进行查找时2时，2<5,则去第0个子分支上继
+	// 续搜索，当进行查找4时，1<4<5,则去第1个分支上去继续查找。
+	value []byte // 当所在node为叶子节点时，记录的为拥有的value
 }
 
 type inodes []inode

@@ -14,6 +14,7 @@ const minKeysPerPage = 2
 const branchPageElementSize = int(unsafe.Sizeof(branchPageElement{}))
 const leafPageElementSize = int(unsafe.Sizeof(leafPageElement{}))
 
+// page.flags
 const (
 	branchPageFlag   = 0x01
 	leafPageFlag     = 0x02
@@ -21,18 +22,27 @@ const (
 	freelistPageFlag = 0x10
 )
 
+// leafPageElement.flags
 const (
 	bucketLeafFlag = 0x01
 )
 
 type pgid uint64
 
+/*
+每个page对应对应一个磁盘上的数据块。这个数据块的layout为:
+| page struct data | page element items | k-v pairs |
+第一部分page struct data是该page的header，存储的就是page struct的数据。
+第二部分page element items其实就是node(下面会讲)的里inode的持久化部分数据。
+第三部分k-v pairs存储的是inode里具体的key-value数据。
+*/
 type page struct {
-	id       pgid
-	flags    uint16
-	count    uint16
-	overflow uint32
-	ptr      uintptr
+	id    pgid   // page的序号
+	flags uint16 // page的类型，有branchPageFlag/leafPageFlag/metaPageFlag/freelistPageFlag几种
+	count uint16 // 当page是freelistPageFlag类型时，存储的是freelist中pgid数组中元素的个数;当page时其他类型时，存储的是inode的个数
+	overflow uint32 // 当写操作数据量大于1个page大小时，该字段记录超出的page数，例如：写入12k的数据，
+	// page大小为4k，则page.overflow=2，标明page header后的2个page大小区域也是该page的区域。
+	ptr uintptr
 }
 
 // typ returns a human readable page type string used for debugging.
@@ -95,8 +105,8 @@ func (s pages) Less(i, j int) bool { return s[i].id < s[j].id }
 
 // branchPageElement represents a node on a branch page.
 type branchPageElement struct {
-	pos   uint32
-	ksize uint32
+	pos   uint32 //key所在位置的偏移量（相对于当前branchPageElement的起始位置）
+	ksize uint32 //key所在位置的偏移量（相对于当前leafPageElement的起始位置）
 	pgid  pgid
 }
 
@@ -108,10 +118,10 @@ func (n *branchPageElement) key() []byte {
 
 // leafPageElement represents a node on a leaf page.
 type leafPageElement struct {
-	flags uint32
-	pos   uint32
-	ksize uint32
-	vsize uint32
+	flags uint32  //标志位 leafPageFlag或者branchPageFlag
+	pos   uint32  //key所在位置的偏移量（相对于当前leafPageElement的起始位置）
+	ksize uint32  //key的长度
+	vsize uint32  //value的长度
 }
 
 // key returns a byte slice of the node key.
@@ -170,7 +180,7 @@ func mergepgids(dst, a, b pgids) {
 		return
 	}
 
-	// Merged will hold all elements from both lists.
+	// Merged will hold all elements from both lists. 有序的合并两个列表的元素
 	merged := dst[:0]
 
 	// Assign lead to the slice with a lower starting value, follow to the higher value.

@@ -6,6 +6,24 @@ import (
 	"unsafe"
 )
 
+/*
+boltdb 是不会释放空间的磁盘空间的，因此需要一个机制来实现磁盘空间的重复利用，freelist就是实现该机制的 文件page缓存
+其有三部分组成，ids记录了当前缓存着的空闲page的pgid，cache中记录的也是这些pgid，采用map记录 方便快速查找。
+当用户需要page时，调用freelist.allocate(n int) pgid，其中n为需要的page数量，其会遍历ids，从中 挑选出连续n个空闲的page，
+然后将其从缓存中剔除，然后将其实的page-id返回给调用者。当不存在满足需求的 page时，返回0，因为文件的起始2个page固定为meta page，
+因此有效的page-id不可能为0。
+
+当某个写事务产生无用page时，将调用freelist.free(txid txid, p *page)将指定page p放入pending池和 cache中。当下一个写事务开启时，
+会将没有Tx引用的pending中的page搬移到ids缓存中。之所以这样做， 是为了支持事务的回滚和并发读事务，从而实现MVCC。
+
+当发起一个读事务时，Tx单独复制一份meta信息，从这份独有的meta作为入口，可以读出该meta指向的数据， 此时即使有一个写事务修改了相关key的
+数据，新修改的数据只会被写入新的page，读事务持有的page会进入pending 池，因此该读事务相关的数据并不会被修改。只有该page相关的读事务
+都结束时，才会从pending池进入到cache池 中，从而被复用修改。
+
+当写事务更新数据时，并不直接覆盖老数据，而且分配一个新的page将更新后的数据写入，然后将老数据占用的page 放入pending池，建立新的索引。
+当事务需要回滚时，只需要将pending池中的page释放，将索引回滚即完成数据的回滚。这样加速了事务的回滚。减少了事务缓存的内存使用，
+同时避免了对正在读的事务的干扰
+*/
 // freelist represents a list of all pages that are available for allocation.
 // It also tracks pages that have been freed but are still in use by open transactions.
 type freelist struct {

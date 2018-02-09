@@ -36,10 +36,10 @@ const DefaultFillPercent = 0.5
 type Bucket struct {
 	*bucket
 	tx       *Tx                // the associated transaction
-	buckets  map[string]*Bucket // subbucket cache
+	buckets  map[string]*Bucket // subbucket cache //本次事务打开的子bucket
 	page     *page              // inline page reference
 	rootNode *node              // materialized node for the root page.
-	nodes    map[pgid]*node     // node cache
+	nodes    map[pgid]*node     // node cache //本次事务缓存的node,node代表有修改的page   (c *Cursor) node() 会使rootNode到指定node路径上的node被加载
 
 	// Sets the threshold for filling nodes when they split. By default,
 	// the bucket will fill to 50% but it can be useful to increase this
@@ -54,7 +54,7 @@ type Bucket struct {
 // then its root page can be stored inline in the "value", after the bucket
 // header. In the case of inline buckets, the "root" will be 0.
 type bucket struct {
-	root     pgid   // page id of the bucket's root-level page
+	root     pgid   // page id of the bucket's root-level page 为0表示inline page
 	sequence uint64 // monotonically incrementing, used by NextSequence()
 }
 
@@ -148,6 +148,7 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 	}
 
 	// Save a reference to the inline page if the bucket is inline.
+	// 如果是inline bucket
 	if child.root == 0 {
 		child.page = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
 	}
@@ -185,6 +186,7 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 		rootNode:    &node{isLeaf: true},
 		FillPercent: DefaultFillPercent,
 	}
+	// bucket也是key value 的一种
 	var value = bucket.write()
 
 	// Insert into node.
@@ -544,7 +546,7 @@ func (b *Bucket) spill() error {
 			*bucket = *child.bucket
 		}
 
-		// Skip writing the bucket if there are no materialized nodes.
+		// Skip writing the bucket if there are no materialized具体化 nodes.（表示该buckets没有修改）
 		if child.rootNode == nil {
 			continue
 		}
@@ -558,6 +560,7 @@ func (b *Bucket) spill() error {
 		if flags&bucketLeafFlag == 0 {
 			panic(fmt.Sprintf("unexpected bucket header flag: %x", flags))
 		}
+		//重新写入child bucket的value,因为child.spill 会导致bucket分配新的page
 		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
 	}
 
@@ -566,7 +569,9 @@ func (b *Bucket) spill() error {
 		return nil
 	}
 
-	// Spill nodes.
+	// Spill nodes.  node代表的是被修改过的page
+	// 一个bucket修改，如果树的深度比较长，每次修改都要修改整个路径吗？ 每个page 4k,那要好多次写
+	// 一个node修改，需要分配新的page,pgid变了，所有parent也要修改，直到bucket，再到root bucket
 	if err := b.rootNode.spill(); err != nil {
 		return err
 	}
@@ -576,6 +581,7 @@ func (b *Bucket) spill() error {
 	if b.rootNode.pgid >= b.tx.meta.pgid {
 		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", b.rootNode.pgid, b.tx.meta.pgid))
 	}
+	// bucket的pgid修改了
 	b.root = b.rootNode.pgid
 
 	return nil
@@ -612,7 +618,7 @@ func (b *Bucket) maxInlineBucketSize() int {
 	return b.tx.db.pageSize / 4
 }
 
-// write allocates and writes a bucket to a byte slice.
+// write allocates and writes a bucket to a byte slice.   // inline bucket才会调用这个函数
 func (b *Bucket) write() []byte {
 	// Allocate the appropriate size.
 	var n = b.rootNode
@@ -622,7 +628,7 @@ func (b *Bucket) write() []byte {
 	var bucket = (*bucket)(unsafe.Pointer(&value[0]))
 	*bucket = *b.bucket
 
-	// Convert byte slice to a fake page and write the root node.
+	// Convert byte slice to a fake page and write the root node. // inline bucket的page是存在value中的
 	var p = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
 	n.write(p)
 
@@ -658,6 +664,7 @@ func (b *Bucket) node(pgid pgid, parent *node) *node {
 
 	// Use the inline page if this is an inline bucket.
 	var p = b.page
+	// not inline bucket
 	if p == nil {
 		p = b.tx.page(pgid)
 	}
@@ -701,10 +708,11 @@ func (b *Bucket) dereference() {
 }
 
 // pageNode returns the in-memory node, if it exists.
-// Otherwise returns the underlying page.
+// Otherwise returns the underlying潜在的 page.
 func (b *Bucket) pageNode(id pgid) (*page, *node) {
-	// Inline buckets have a fake page embedded in their value so treat them
+	// Inline buckets have a fake伪造的 page embedded in their value so treat them
 	// differently. We'll return the rootNode (if available) or the fake page.
+	// Inline buckets 用b.root(pgid)==0来做标志，因为pgid 0 为meta保留的
 	if b.root == 0 {
 		if id != 0 {
 			panic(fmt.Sprintf("inline bucket non-zero page access(2): %d != 0", id))

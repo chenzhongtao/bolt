@@ -15,9 +15,12 @@ import (
 // Changing data while traversing with a cursor may cause it to be invalidated
 // and return unexpected keys and/or values. You must reposition your cursor
 // after mutating data.
+/*
+Cursor是遍历Bucket的迭代器
+*/
 type Cursor struct {
-	bucket *Bucket
-	stack  []elemRef
+	bucket *Bucket   // parent Bucket
+	stack  []elemRef // 遍历过程中记录走过的page-id或者node，elemRef中的page、node同时只能有一个存在
 }
 
 // Bucket returns the bucket that this cursor was created from.
@@ -87,6 +90,7 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 
 	// Attempt to move back one element until we're successful.
 	// Move up the stack as we hit the beginning of each page in our stack.
+	// 找个一个树枝，可以index--，如果找不到，表示没有Prev
 	for i := len(c.stack) - 1; i >= 0; i-- {
 		elem := &c.stack[i]
 		if elem.index > 0 {
@@ -102,6 +106,7 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 	}
 
 	// Move down the stack to find the last element of the last leaf under this branch.
+	// 重新分支开始查找最后一个
 	c.last()
 	k, v, flags := c.keyValue()
 	if (flags & uint32(bucketLeafFlag)) != 0 {
@@ -114,6 +119,7 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 // If the key does not exist then the next key is used. If no keys
 // follow, a nil key is returned.
 // The returned key and value are only valid for the life of the transaction.
+// 如果key不存在，定位到下一个key,如果比最后一个key还大，返回nil
 func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
 	k, v, flags := c.seek(seek)
 
@@ -220,6 +226,7 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 		// Attempt to move over one element until we're successful.
 		// Move up the stack as we hit the end of each page in our stack.
 		var i int
+		// 找个一个树枝，可以index++，如果找不到，表示没有next
 		for i = len(c.stack) - 1; i >= 0; i-- {
 			elem := &c.stack[i]
 			if elem.index < elem.count()-1 {
@@ -237,6 +244,7 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 		// Otherwise start from where we left off in the stack and find the
 		// first element of the first leaf page.
 		c.stack = c.stack[:i+1]
+		// 重新分支开始查找第一个
 		c.first()
 
 		// If this is an empty page then restart and move back up the stack.
@@ -282,6 +290,7 @@ func (c *Cursor) searchNode(key []byte, n *node) {
 		}
 		return ret != -1
 	})
+	// 如果没找到，index--，应该Search返回的index是 data[index] >= key
 	if !exact && index > 0 {
 		index--
 	}
@@ -305,6 +314,7 @@ func (c *Cursor) searchPage(key []byte, p *page) {
 		}
 		return ret != -1
 	})
+	// 如果没找到，index--，应该Search返回的index是 data[index] >= key
 	if !exact && index > 0 {
 		index--
 	}

@@ -59,6 +59,8 @@ var (
 // PageHeaderSize represents the size of the bolt.page header.
 const PageHeaderSize = 16
 
+const bucketHeaderSize = int(unsafe.Sizeof(bucket{}))
+
 func main() {
 	m := NewMain()
 	if err := m.Run(os.Args[1:]...); err == ErrUsage {
@@ -131,12 +133,14 @@ Usage:
 The commands are:
 
     bench       run synthetic benchmark against bolt
-    check       verifies integrity of bolt database
+    check       verifies integrity of bolt database | ./bolt check my.db
     compact     copies a bolt database, compacting it in the process
-    info        print basic info
+    dump        dump page hex data | ./bolt dump my.db 1
+    info        print basic info |  ./bolt info my.db
     help        print this screen
-    pages       print list of pages with their types
-    stats       iterate over all pages and generate usage stats
+    page        print page info | for((i=0;i<=58;i++));do echo $i;done |xargs ./bolt page my.db |  ./bolt pages my.db |grep -v -w -E "free|ID" |grep -v "=" | awk '{print $1}' |xargs ./bolt page my.db
+    pages       print list of pages with their types  | ./bolt pages my.db
+    stats       iterate over all pages and generate usage stats | ./bolt stats my.db
 
 Use "bolt [command] -h" for more information about a command.
 `, "\n")
@@ -547,7 +551,17 @@ func (cmd *PageCommand) PrintLeaf(w io.Writer, buf []byte) error {
 			v = fmt.Sprintf("%x", string(e.value()))
 		}
 
-		fmt.Fprintf(w, "%s: %s\n", k, v)
+		fmt.Fprintf(w, "%+v %s: %s\n", e, k, v)
+		// add print inline bucket
+		if (e.flags & uint32(bucketLeafFlag)) != 0 {
+			b := (*bucket)(unsafe.Pointer(&e.value()[0]))
+			if b.root == pgid(0) {
+				fmt.Fprintf(w, "inline bucket\n")
+				p := (*page)(unsafe.Pointer(&e.value()[bucketHeaderSize]))
+				fmt.Printf("inline page : %+v\n", p)
+				cmd.PrintLeaf(w, e.value()[bucketHeaderSize:])
+			}
+		}
 	}
 	fmt.Fprintf(w, "\n")
 	return nil
@@ -573,7 +587,7 @@ func (cmd *PageCommand) PrintBranch(w io.Writer, buf []byte) error {
 			k = fmt.Sprintf("%x", string(e.key()))
 		}
 
-		fmt.Fprintf(w, "%s: <pgid=%d>\n", k, e.pgid)
+		fmt.Fprintf(w, "%+v %s: <pgid=%d>\n", e, k, e.pgid)
 	}
 	fmt.Fprintf(w, "\n")
 	return nil
